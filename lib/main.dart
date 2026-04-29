@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:youtube_player_flutter/youtube_player_flutter.dart';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
 // ─────────────────────────────────────────────
 //  ENTRY POINT
@@ -114,7 +115,36 @@ class SpotifyService {
     return tracks;
   }
 
+  // ── Lyrics via lrclib.net (free, no key needed) ──────────────────────────
   Future<String?> getLyrics(String artist, String title) async {
+    try {
+      // Try lrclib first — returns plain lyrics field
+      final uri = Uri.parse('https://lrclib.net/api/get').replace(
+        queryParameters: {
+          'artist_name': artist,
+          'track_name': title,
+        },
+      );
+      final res = await http.get(uri, headers: {'User-Agent': 'SurfacePlayer/1.0'});
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body) as Map<String, dynamic>;
+        // Prefer plain lyrics; fall back to synced
+        final plain = data['plainLyrics'] as String?;
+        if (plain != null && plain.trim().isNotEmpty) return plain;
+        final synced = data['syncedLyrics'] as String?;
+        if (synced != null && synced.trim().isNotEmpty) {
+          // Strip timestamps like [00:12.34]
+          final stripped = synced
+              .split('\n')
+              .map((l) => l.replaceAll(RegExp(r'^\[\d+:\d+\.\d+\]\s*'), ''))
+              .where((l) => l.trim().isNotEmpty)
+              .join('\n');
+          return stripped;
+        }
+      }
+    } catch (_) {}
+
+    // Fallback: lyrics.ovh
     try {
       final uri = Uri.parse(
           'https://api.lyrics.ovh/v1/${Uri.encodeComponent(artist)}/${Uri.encodeComponent(title)}');
@@ -177,70 +207,55 @@ class SpotifyTrack {
 }
 
 // ─────────────────────────────────────────────
-//  YOUTUBE SERVICE
+//  YOUTUBE SERVICE — uses youtube_explode_dart
+//  No API key needed. Scrapes YT directly.
 // ─────────────────────────────────────────────
 class YouTubeService {
-  // Get a free key at console.cloud.google.com → YouTube Data API v3
-  static const _ytKey = 'YOUR_YOUTUBE_API_KEY_HERE';
+  final _yt = YoutubeExplode();
 
+  /// Returns the best YouTube video ID for the given Spotify track.
   Future<String?> findVideoId(SpotifyTrack track) async {
     final queries = [
-      '"${track.title}" "${track.artist}" official audio',
-      '"${track.title}" "${track.artist}" official video',
       '${track.artist} ${track.title} official audio',
+      '${track.artist} ${track.title} official video',
+      '${track.artist} ${track.title}',
     ];
+
     for (final q in queries) {
-      final id = await _searchYT(q, track);
-      if (id != null) return id;
+      try {
+        final results = await _yt.search.search(q);
+        for (final video in results.take(5)) {
+          final vtitle = video.title.toLowerCase();
+          final vauthor = video.author.toLowerCase();
+          final trackTitle = track.title.toLowerCase();
+          final artistFirst = track.artist.toLowerCase().split(',').first.trim();
+
+          final isCover = vtitle.contains('cover') ||
+              vtitle.contains('karaoke') ||
+              vtitle.contains('tribute') ||
+              vtitle.contains('reaction') ||
+              (vtitle.contains('remix') && !trackTitle.contains('remix'));
+
+          final isRelevant = vtitle.contains(trackTitle) ||
+              vauthor.contains(artistFirst) ||
+              vtitle.contains(artistFirst);
+
+          if (!isCover && isRelevant) {
+            return video.id.value;
+          }
+        }
+        // If nothing matches filters, return first result of first query
+        if (q == queries.last && results.isNotEmpty) {
+          return results.first.id.value;
+        }
+      } catch (_) {
+        continue;
+      }
     }
     return null;
   }
 
-  Future<String?> _searchYT(String query, SpotifyTrack track) async {
-    try {
-      final uri = Uri.parse('https://www.googleapis.com/youtube/v3/search')
-          .replace(queryParameters: {
-        'part': 'snippet',
-        'q': query,
-        'type': 'video',
-        'maxResults': '5',
-        'videoCategoryId': '10',
-        'key': _ytKey,
-      });
-      final res = await http.get(uri);
-      if (res.statusCode != 200) return null;
-      final data = jsonDecode(res.body) as Map<String, dynamic>;
-      final items = data['items'] as List<dynamic>;
-      if (items.isEmpty) return null;
-
-      for (var i = 0; i < items.length; i++) {
-        final item = items[i] as Map<String, dynamic>;
-        final snippet = item['snippet'] as Map<String, dynamic>;
-        final videoTitle = (snippet['title'] as String).toLowerCase();
-        final channelTitle = (snippet['channelTitle'] as String).toLowerCase();
-        final trackTitle = track.title.toLowerCase();
-        final artistName = track.artist.toLowerCase().split(',').first.trim();
-
-        final isCover = videoTitle.contains('cover') ||
-            videoTitle.contains('tribute') ||
-            videoTitle.contains('karaoke') ||
-            videoTitle.contains('reaction') ||
-            (videoTitle.contains('remix') && !trackTitle.contains('remix'));
-
-        final isOfficial = channelTitle.contains('vevo') ||
-            channelTitle.contains(artistName) ||
-            videoTitle.contains('official');
-
-        if (!isCover && (isOfficial || i == 0)) {
-          return (item['id'] as Map<String, dynamic>)['videoId'] as String;
-        }
-      }
-      return ((items[0] as Map<String, dynamic>)['id']
-          as Map<String, dynamic>)['videoId'] as String;
-    } catch (_) {
-      return null;
-    }
-  }
+  void dispose() => _yt.close();
 }
 
 // ─────────────────────────────────────────────
@@ -278,6 +293,7 @@ class PlayerState extends ChangeNotifier {
   int queueIndex = -1;
   String? lyrics;
   bool loadingLyrics = false;
+  bool loadingVideo = false;
   YoutubePlayerController? ytController;
 
   final _spotify = SpotifyService();
@@ -290,14 +306,20 @@ class PlayerState extends ChangeNotifier {
     isPlaying = false;
     lyrics = null;
     currentVideoId = null;
+    loadingVideo = true;
     notifyListeners();
     _loadVideo(track);
     _fetchLyrics(track);
   }
 
   Future<void> _loadVideo(SpotifyTrack track) async {
-    final vid = await _youtube.findVideoId(track);
-    currentVideoId = vid;
+    try {
+      final vid = await _youtube.findVideoId(track);
+      currentVideoId = vid;
+    } catch (_) {
+      currentVideoId = null;
+    }
+    loadingVideo = false;
     notifyListeners();
   }
 
@@ -334,7 +356,6 @@ class PlayerState extends ChangeNotifier {
     notifyListeners();
   }
 
-  // Expose notifyListeners publicly for onReady callback
   void notifyReady() {
     isPlaying = true;
     notifyListeners();
@@ -439,20 +460,12 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           Positioned(
             top: -60,
             right: -60,
-            child: _Orb(
-              size: 220,
-              color: kPurple4.withValues(alpha: 0.25),
-              anim: _bgAnim,
-            ),
+            child: _Orb(size: 220, color: kPurple4.withValues(alpha: 0.25), anim: _bgAnim),
           ),
           Positioned(
             bottom: 100,
             left: -80,
-            child: _Orb(
-              size: 280,
-              color: kViolet.withValues(alpha: 0.12),
-              anim: _pulseAnim,
-            ),
+            child: _Orb(size: 280, color: kViolet.withValues(alpha: 0.12), anim: _pulseAnim),
           ),
           SafeArea(
             child: Column(
@@ -468,10 +481,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           ListenableBuilder(
             listenable: playerState,
             builder: (_, child) => playerState.currentTrack != null
-                ? Positioned(
-                    bottom: 0, left: 0, right: 0,
-                    child: _MiniPlayer(),
-                  )
+                ? Positioned(bottom: 0, left: 0, right: 0, child: _MiniPlayer())
                 : const SizedBox.shrink(),
           ),
         ],
@@ -539,16 +549,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
               prefixIcon: const Icon(Icons.search_rounded, color: kViolet),
               suffixIcon: _searchMode
                   ? IconButton(
-                      icon: Icon(
-                        Icons.close_rounded,
-                        color: kWhite.withValues(alpha: 0.5),
-                      ),
+                      icon: Icon(Icons.close_rounded, color: kWhite.withValues(alpha: 0.5)),
                       onPressed: () {
                         _searchCtrl.clear();
-                        setState(() {
-                          _searchMode = false;
-                          _results = [];
-                        });
+                        setState(() { _searchMode = false; _results = []; });
                       },
                     )
                   : null,
@@ -600,12 +604,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.music_off_rounded,
-                size: 56, color: kViolet.withValues(alpha: 0.4)),
+            Icon(Icons.music_off_rounded, size: 56, color: kViolet.withValues(alpha: 0.4)),
             const SizedBox(height: 12),
-            Text('No results',
-                style: TextStyle(
-                    color: kWhite.withValues(alpha: 0.4), fontSize: 16)),
+            Text('No results', style: TextStyle(color: kWhite.withValues(alpha: 0.4), fontSize: 16)),
           ],
         ),
       );
@@ -626,10 +627,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       PageRouteBuilder(
         pageBuilder: (_, a, s) => const PlayerScreen(),
         transitionsBuilder: (_, a, s, child) => SlideTransition(
-          position: Tween<Offset>(
-            begin: const Offset(0, 1),
-            end: Offset.zero,
-          ).animate(CurvedAnimation(parent: a, curve: Curves.easeOutCubic)),
+          position: Tween<Offset>(begin: const Offset(0, 1), end: Offset.zero)
+              .animate(CurvedAnimation(parent: a, curve: Curves.easeOutCubic)),
           child: child,
         ),
         transitionDuration: const Duration(milliseconds: 400),
@@ -648,8 +647,7 @@ class PlayerScreen extends StatefulWidget {
   State<PlayerScreen> createState() => _PlayerScreenState();
 }
 
-class _PlayerScreenState extends State<PlayerScreen>
-    with TickerProviderStateMixin {
+class _PlayerScreenState extends State<PlayerScreen> with TickerProviderStateMixin {
   late AnimationController _discAnim;
   late AnimationController _slideAnim;
   late AnimationController _glowAnim;
@@ -660,15 +658,9 @@ class _PlayerScreenState extends State<PlayerScreen>
   @override
   void initState() {
     super.initState();
-    _discAnim = AnimationController(
-        vsync: this, duration: const Duration(seconds: 12))
-      ..repeat();
-    _slideAnim = AnimationController(
-        vsync: this, duration: const Duration(milliseconds: 600))
-      ..forward();
-    _glowAnim = AnimationController(
-        vsync: this, duration: const Duration(seconds: 3))
-      ..repeat(reverse: true);
+    _discAnim = AnimationController(vsync: this, duration: const Duration(seconds: 12))..repeat();
+    _slideAnim = AnimationController(vsync: this, duration: const Duration(milliseconds: 600))..forward();
+    _glowAnim = AnimationController(vsync: this, duration: const Duration(seconds: 3))..repeat(reverse: true);
 
     playerState.addListener(_onStateChange);
     if (playerState.currentVideoId != null) {
@@ -738,7 +730,7 @@ class _PlayerScreenState extends State<PlayerScreen>
                 child: Image.network(
                   track.imageUrl,
                   fit: BoxFit.cover,
-                    errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                  errorBuilder: (_, __, ___) => const SizedBox.shrink(),
                 ),
               ),
             ),
@@ -754,8 +746,7 @@ class _PlayerScreenState extends State<PlayerScreen>
                   shape: BoxShape.circle,
                   boxShadow: [
                     BoxShadow(
-                      color: kViolet.withValues(
-                          alpha: 0.15 + _glowAnim.value * 0.15),
+                      color: kViolet.withValues(alpha: 0.15 + _glowAnim.value * 0.15),
                       blurRadius: 80 + _glowAnim.value * 40,
                       spreadRadius: 20,
                     ),
@@ -769,13 +760,12 @@ class _PlayerScreenState extends State<PlayerScreen>
               children: [
                 _buildTopBar(context),
                 Expanded(
-                  child: _showLyrics
-                      ? _buildLyricsView(track)
-                      : _buildPlayerView(track),
+                  child: _showLyrics ? _buildLyricsView(track) : _buildPlayerView(track),
                 ),
               ],
             ),
           ),
+          // Hidden YouTube player — renders off-screen but must be in tree
           if (_ytCtrl != null)
             Positioned(
               bottom: -300,
@@ -789,6 +779,38 @@ class _PlayerScreenState extends State<PlayerScreen>
                 ),
               ),
             ),
+          // Loading overlay while finding video
+          if (playerState.loadingVideo)
+            Positioned(
+              bottom: 80,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: kPurple2.withValues(alpha: 0.9),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: kViolet.withValues(alpha: 0.3)),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          valueColor: AlwaysStoppedAnimation(kViolet),
+                        ),
+                      ),
+                      SizedBox(width: 10),
+                      Text('Finding audio…', style: TextStyle(color: kWhite, fontSize: 13)),
+                    ],
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -799,32 +821,22 @@ class _PlayerScreenState extends State<PlayerScreen>
         child: Row(
           children: [
             IconButton(
-              icon: const Icon(Icons.keyboard_arrow_down_rounded,
-                  size: 32, color: kWhite),
+              icon: const Icon(Icons.keyboard_arrow_down_rounded, size: 32, color: kWhite),
               onPressed: () => Navigator.pop(context),
             ),
             const Spacer(),
             ShaderMask(
               shaderCallback: (b) =>
-                  const LinearGradient(colors: [kViolet, kNeon])
-                      .createShader(b),
+                  const LinearGradient(colors: [kViolet, kNeon]).createShader(b),
               child: const Text(
                 'Now Playing',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                ),
+                style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600),
               ),
             ),
             const Spacer(),
             IconButton(
-              icon: Icon(
-                _showLyrics ? Icons.music_note_rounded : Icons.lyrics_rounded,
-                color: kWhite,
-              ),
-              onPressed: () =>
-                  setState(() => _showLyrics = !_showLyrics),
+              icon: Icon(_showLyrics ? Icons.music_note_rounded : Icons.lyrics_rounded, color: kWhite),
+              onPressed: () => setState(() => _showLyrics = !_showLyrics),
             ),
           ],
         ),
@@ -854,12 +866,7 @@ class _PlayerScreenState extends State<PlayerScreen>
               children: [
                 Text(
                   track.title,
-                  style: const TextStyle(
-                    color: kWhite,
-                    fontSize: 24,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: -0.3,
-                  ),
+                  style: const TextStyle(color: kWhite, fontSize: 24, fontWeight: FontWeight.w700, letterSpacing: -0.3),
                   textAlign: TextAlign.center,
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
@@ -867,17 +874,13 @@ class _PlayerScreenState extends State<PlayerScreen>
                 const SizedBox(height: 6),
                 Text(
                   track.artist,
-                  style: TextStyle(
-                      color: kWhite.withValues(alpha: 0.55),
-                      fontSize: 15,
-                      fontWeight: FontWeight.w500),
+                  style: TextStyle(color: kWhite.withValues(alpha: 0.55), fontSize: 15, fontWeight: FontWeight.w500),
                   textAlign: TextAlign.center,
                 ),
                 const SizedBox(height: 4),
                 Text(
                   track.album,
-                  style: TextStyle(
-                      color: kViolet.withValues(alpha: 0.7), fontSize: 13),
+                  style: TextStyle(color: kViolet.withValues(alpha: 0.7), fontSize: 13),
                   textAlign: TextAlign.center,
                 ),
               ],
@@ -899,13 +902,8 @@ class _PlayerScreenState extends State<PlayerScreen>
         decoration: BoxDecoration(
           shape: BoxShape.circle,
           boxShadow: [
-            BoxShadow(
-                color: kViolet.withValues(alpha: 0.4),
-                blurRadius: 40,
-                spreadRadius: 8),
-            BoxShadow(
-                color: Colors.black.withValues(alpha: 0.6),
-                blurRadius: 20),
+            BoxShadow(color: kViolet.withValues(alpha: 0.4), blurRadius: 40, spreadRadius: 8),
+            BoxShadow(color: Colors.black.withValues(alpha: 0.6), blurRadius: 20),
           ],
         ),
         child: Stack(
@@ -933,16 +931,14 @@ class _PlayerScreenState extends State<PlayerScreen>
                         width: 160,
                         height: 160,
                         color: kPurple3,
-                        child: const Icon(Icons.music_note_rounded,
-                            size: 48, color: kViolet),
+                        child: const Icon(Icons.music_note_rounded, size: 48, color: kViolet),
                       ),
                     )
                   : Container(
                       width: 160,
                       height: 160,
                       color: kPurple3,
-                      child: const Icon(Icons.music_note_rounded,
-                          size: 48, color: kViolet),
+                      child: const Icon(Icons.music_note_rounded, size: 48, color: kViolet),
                     ),
             ),
             Container(
@@ -951,8 +947,7 @@ class _PlayerScreenState extends State<PlayerScreen>
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
                 color: kPurple1,
-                border: Border.all(
-                    color: kViolet.withValues(alpha: 0.5), width: 2),
+                border: Border.all(color: kViolet.withValues(alpha: 0.5), width: 2),
               ),
             ),
           ],
@@ -968,9 +963,8 @@ class _PlayerScreenState extends State<PlayerScreen>
           children: [
             Container(
               height: 4,
-              decoration: BoxDecoration(
-                  color: kGlass, borderRadius: BorderRadius.circular(2)),
-              child: playerState.currentVideoId == null
+              decoration: BoxDecoration(color: kGlass, borderRadius: BorderRadius.circular(2)),
+              child: playerState.loadingVideo
                   ? const LinearProgressIndicator(
                       backgroundColor: Colors.transparent,
                       valueColor: AlwaysStoppedAnimation(kViolet),
@@ -981,12 +975,9 @@ class _PlayerScreenState extends State<PlayerScreen>
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text('0:00',
-                    style: TextStyle(
-                        color: kWhite.withValues(alpha: 0.4), fontSize: 12)),
+                Text('0:00', style: TextStyle(color: kWhite.withValues(alpha: 0.4), fontSize: 12)),
                 Text(playerState.currentTrack?.duration ?? '--:--',
-                    style: TextStyle(
-                        color: kWhite.withValues(alpha: 0.4), fontSize: 12)),
+                    style: TextStyle(color: kWhite.withValues(alpha: 0.4), fontSize: 12)),
               ],
             ),
           ],
@@ -994,7 +985,6 @@ class _PlayerScreenState extends State<PlayerScreen>
       );
     }
 
-    // ValueListenableBuilder works with YoutubePlayerController
     return ValueListenableBuilder<YoutubePlayerValue>(
       valueListenable: ctrl,
       builder: (context, value, child) {
@@ -1011,10 +1001,8 @@ class _PlayerScreenState extends State<PlayerScreen>
               SliderTheme(
                 data: SliderThemeData(
                   trackHeight: 4,
-                  thumbShape:
-                      const RoundSliderThumbShape(enabledThumbRadius: 6),
-                  overlayShape:
-                      const RoundSliderOverlayShape(overlayRadius: 14),
+                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                  overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
                   activeTrackColor: kViolet,
                   inactiveTrackColor: kGlass,
                   thumbColor: kNeon,
@@ -1023,8 +1011,7 @@ class _PlayerScreenState extends State<PlayerScreen>
                 child: Slider(
                   value: progress.clamp(0.0, 1.0),
                   onChanged: (v) {
-                    final seekTo = Duration(
-                        milliseconds: (v * dur.inMilliseconds).toInt());
+                    final seekTo = Duration(milliseconds: (v * dur.inMilliseconds).toInt());
                     ctrl.seekTo(seekTo);
                   },
                 ),
@@ -1035,13 +1022,9 @@ class _PlayerScreenState extends State<PlayerScreen>
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Text(_fmtDuration(pos),
-                        style: TextStyle(
-                            color: kWhite.withValues(alpha: 0.4),
-                            fontSize: 12)),
+                        style: TextStyle(color: kWhite.withValues(alpha: 0.4), fontSize: 12)),
                     Text(_fmtDuration(dur),
-                        style: TextStyle(
-                            color: kWhite.withValues(alpha: 0.4),
-                            fontSize: 12)),
+                        style: TextStyle(color: kWhite.withValues(alpha: 0.4), fontSize: 12)),
                   ],
                 ),
               ),
@@ -1055,10 +1038,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   Widget _buildControls() => Row(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          _CtrlBtn(
-              icon: Icons.skip_previous_rounded,
-              size: 32,
-              onTap: () => playerState.previous()),
+          _CtrlBtn(icon: Icons.skip_previous_rounded, size: 32, onTap: () => playerState.previous()),
           const SizedBox(width: 20),
           GestureDetector(
             onTap: () => playerState.togglePlay(),
@@ -1076,17 +1056,14 @@ class _PlayerScreenState extends State<PlayerScreen>
                   ),
                   boxShadow: [
                     BoxShadow(
-                      color: kViolet.withValues(
-                          alpha: 0.4 + _glowAnim.value * 0.3),
+                      color: kViolet.withValues(alpha: 0.4 + _glowAnim.value * 0.3),
                       blurRadius: 24 + _glowAnim.value * 12,
                       spreadRadius: 2,
                     ),
                   ],
                 ),
                 child: Icon(
-                  playerState.isPlaying
-                      ? Icons.pause_rounded
-                      : Icons.play_arrow_rounded,
+                  playerState.isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
                   color: Colors.white,
                   size: 36,
                 ),
@@ -1094,10 +1071,7 @@ class _PlayerScreenState extends State<PlayerScreen>
             ),
           ),
           const SizedBox(width: 20),
-          _CtrlBtn(
-              icon: Icons.skip_next_rounded,
-              size: 32,
-              onTap: () => playerState.next()),
+          _CtrlBtn(icon: Icons.skip_next_rounded, size: 32, onTap: () => playerState.next()),
         ],
       );
 
@@ -1112,14 +1086,8 @@ class _PlayerScreenState extends State<PlayerScreen>
               ClipRRect(
                 borderRadius: BorderRadius.circular(12),
                 child: track.imageUrl.isNotEmpty
-                    ? Image.network(
-                        track.imageUrl,
-                        width: 56,
-                        height: 56,
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, __, ___) =>
-                            Container(width: 56, height: 56, color: kPurple3),
-                      )
+                    ? Image.network(track.imageUrl, width: 56, height: 56, fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => Container(width: 56, height: 56, color: kPurple3))
                     : Container(width: 56, height: 56, color: kPurple3),
               ),
               const SizedBox(width: 16),
@@ -1128,14 +1096,9 @@ class _PlayerScreenState extends State<PlayerScreen>
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(track.title,
-                        style: const TextStyle(
-                            color: kWhite,
-                            fontWeight: FontWeight.w700,
-                            fontSize: 16)),
+                        style: const TextStyle(color: kWhite, fontWeight: FontWeight.w700, fontSize: 16)),
                     Text(track.artist,
-                        style: TextStyle(
-                            color: kWhite.withValues(alpha: 0.5),
-                            fontSize: 13)),
+                        style: TextStyle(color: kWhite.withValues(alpha: 0.5), fontSize: 13)),
                   ],
                 ),
               ),
@@ -1148,20 +1111,17 @@ class _PlayerScreenState extends State<PlayerScreen>
             Center(
               child: Column(
                 children: [
-                  Icon(Icons.lyrics_outlined,
-                      size: 48, color: kViolet.withValues(alpha: 0.3)),
+                  Icon(Icons.lyrics_outlined, size: 48, color: kViolet.withValues(alpha: 0.3)),
                   const SizedBox(height: 12),
                   Text('Lyrics not available',
-                      style: TextStyle(
-                          color: kWhite.withValues(alpha: 0.35), fontSize: 15)),
+                      style: TextStyle(color: kWhite.withValues(alpha: 0.35), fontSize: 15)),
                 ],
               ),
             )
           else
             Text(
               playerState.lyrics!,
-              style: const TextStyle(
-                  color: kWhite, fontSize: 16, height: 1.9, letterSpacing: 0.2),
+              style: const TextStyle(color: kWhite, fontSize: 16, height: 1.9, letterSpacing: 0.2),
             ),
         ],
       ),
@@ -1187,11 +1147,8 @@ class _MiniPlayer extends StatelessWidget {
         PageRouteBuilder(
           pageBuilder: (_, a, s) => const PlayerScreen(),
           transitionsBuilder: (_, a, s, child) => SlideTransition(
-            position: Tween<Offset>(
-              begin: const Offset(0, 1),
-              end: Offset.zero,
-            ).animate(
-                CurvedAnimation(parent: a, curve: Curves.easeOutCubic)),
+            position: Tween<Offset>(begin: const Offset(0, 1), end: Offset.zero)
+                .animate(CurvedAnimation(parent: a, curve: Curves.easeOutCubic)),
             child: child,
           ),
           transitionDuration: const Duration(milliseconds: 400),
@@ -1208,12 +1165,8 @@ class _MiniPlayer extends StatelessWidget {
             end: Alignment.bottomRight,
           ),
           boxShadow: [
-            BoxShadow(
-                color: kViolet.withValues(alpha: 0.3),
-                blurRadius: 20,
-                spreadRadius: 2),
-            BoxShadow(
-                color: Colors.black.withValues(alpha: 0.5), blurRadius: 10),
+            BoxShadow(color: kViolet.withValues(alpha: 0.3), blurRadius: 20, spreadRadius: 2),
+            BoxShadow(color: Colors.black.withValues(alpha: 0.5), blurRadius: 10),
           ],
           border: Border.all(color: kViolet.withValues(alpha: 0.25), width: 1),
         ),
@@ -1231,16 +1184,14 @@ class _MiniPlayer extends StatelessWidget {
                         width: 44,
                         height: 44,
                         color: kPurple3,
-                        child: const Icon(Icons.music_note_rounded,
-                            color: kViolet),
+                        child: const Icon(Icons.music_note_rounded, color: kViolet),
                       ),
                     )
                   : Container(
                       width: 44,
                       height: 44,
                       color: kPurple3,
-                      child: const Icon(Icons.music_note_rounded,
-                          color: kViolet),
+                      child: const Icon(Icons.music_note_rounded, color: kViolet),
                     ),
             ),
             const SizedBox(width: 12),
@@ -1250,15 +1201,11 @@ class _MiniPlayer extends StatelessWidget {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(track.title,
-                      style: const TextStyle(
-                          color: kWhite,
-                          fontWeight: FontWeight.w600,
-                          fontSize: 14),
+                      style: const TextStyle(color: kWhite, fontWeight: FontWeight.w600, fontSize: 14),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis),
                   Text(track.artist,
-                      style: TextStyle(
-                          color: kWhite.withValues(alpha: 0.5), fontSize: 12),
+                      style: TextStyle(color: kWhite.withValues(alpha: 0.5), fontSize: 12),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis),
                 ],
@@ -1266,16 +1213,13 @@ class _MiniPlayer extends StatelessWidget {
             ),
             IconButton(
               icon: Icon(
-                playerState.isPlaying
-                    ? Icons.pause_rounded
-                    : Icons.play_arrow_rounded,
+                playerState.isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
                 color: kNeon,
               ),
               onPressed: () => playerState.togglePlay(),
             ),
             IconButton(
-              icon: Icon(Icons.skip_next_rounded,
-                  color: kWhite.withValues(alpha: 0.7)),
+              icon: Icon(Icons.skip_next_rounded, color: kWhite.withValues(alpha: 0.7)),
               onPressed: () => playerState.next(),
             ),
           ],
@@ -1314,7 +1258,6 @@ class _Orb extends StatelessWidget {
 
 class _SectionTitle extends StatelessWidget {
   final String text;
-
   const _SectionTitle(this.text);
 
   @override
@@ -1336,22 +1279,19 @@ class _SectionTitle extends StatelessWidget {
 class _FeaturedCard extends StatefulWidget {
   final SpotifyTrack track;
   final VoidCallback onTap;
-
   const _FeaturedCard({required this.track, required this.onTap});
 
   @override
   State<_FeaturedCard> createState() => _FeaturedCardState();
 }
 
-class _FeaturedCardState extends State<_FeaturedCard>
-    with SingleTickerProviderStateMixin {
+class _FeaturedCardState extends State<_FeaturedCard> with SingleTickerProviderStateMixin {
   late AnimationController _hoverAnim;
 
   @override
   void initState() {
     super.initState();
-    _hoverAnim = AnimationController(
-        vsync: this, duration: const Duration(milliseconds: 200));
+    _hoverAnim = AnimationController(vsync: this, duration: const Duration(milliseconds: 200));
   }
 
   @override
@@ -1375,40 +1315,34 @@ class _FeaturedCardState extends State<_FeaturedCard>
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(18),
                 color: kGlass,
-                border: Border.all(
-                    color: kViolet.withValues(alpha: 0.2), width: 1),
+                border: Border.all(color: kViolet.withValues(alpha: 0.2), width: 1),
                 boxShadow: [
-                  BoxShadow(
-                      color: kPurple4.withValues(alpha: 0.2),
-                      blurRadius: 16),
+                  BoxShadow(color: kPurple4.withValues(alpha: 0.2), blurRadius: 16),
                 ],
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   ClipRRect(
-                    borderRadius:
-                        const BorderRadius.vertical(top: Radius.circular(18)),
+                    borderRadius: const BorderRadius.vertical(top: Radius.circular(18)),
                     child: widget.track.imageUrl.isNotEmpty
                         ? Image.network(
                             widget.track.imageUrl,
                             width: 145,
                             height: 130,
                             fit: BoxFit.cover,
-                              errorBuilder: (_, __, ___) => Container(
+                            errorBuilder: (_, __, ___) => Container(
                               width: 145,
                               height: 130,
                               color: kPurple3,
-                              child: const Icon(Icons.music_note_rounded,
-                                  size: 40, color: kViolet),
+                              child: const Icon(Icons.music_note_rounded, size: 40, color: kViolet),
                             ),
                           )
                         : Container(
                             width: 145,
                             height: 130,
                             color: kPurple3,
-                            child: const Icon(Icons.music_note_rounded,
-                                size: 40, color: kViolet),
+                            child: const Icon(Icons.music_note_rounded, size: 40, color: kViolet),
                           ),
                   ),
                   Padding(
@@ -1417,17 +1351,12 @@ class _FeaturedCardState extends State<_FeaturedCard>
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(widget.track.title,
-                            style: const TextStyle(
-                                color: kWhite,
-                                fontSize: 12,
-                                fontWeight: FontWeight.w600),
+                            style: const TextStyle(color: kWhite, fontSize: 12, fontWeight: FontWeight.w600),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis),
                         const SizedBox(height: 2),
                         Text(widget.track.artist,
-                            style: TextStyle(
-                                color: kWhite.withValues(alpha: 0.45),
-                                fontSize: 11),
+                            style: TextStyle(color: kWhite.withValues(alpha: 0.45), fontSize: 11),
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis),
                       ],
@@ -1444,22 +1373,19 @@ class _FeaturedCardState extends State<_FeaturedCard>
 class _TrackTile extends StatefulWidget {
   final SpotifyTrack track;
   final VoidCallback onTap;
-
   const _TrackTile({required this.track, required this.onTap});
 
   @override
   State<_TrackTile> createState() => _TrackTileState();
 }
 
-class _TrackTileState extends State<_TrackTile>
-    with SingleTickerProviderStateMixin {
+class _TrackTileState extends State<_TrackTile> with SingleTickerProviderStateMixin {
   late AnimationController _anim;
 
   @override
   void initState() {
     super.initState();
-    _anim = AnimationController(
-        vsync: this, duration: const Duration(milliseconds: 150));
+    _anim = AnimationController(vsync: this, duration: const Duration(milliseconds: 150));
   }
 
   @override
@@ -1478,14 +1404,12 @@ class _TrackTileState extends State<_TrackTile>
           animation: _anim,
           builder: (_, child) => Container(
             margin: const EdgeInsets.only(bottom: 8),
-            padding:
-                const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(14),
               color: Color.lerp(kGlassB, kGlass, _anim.value),
               border: Border.all(
-                  color: kViolet.withValues(alpha: 0.1 + _anim.value * 0.15),
-                  width: 1),
+                  color: kViolet.withValues(alpha: 0.1 + _anim.value * 0.15), width: 1),
             ),
             child: Row(
               children: [
@@ -1497,20 +1421,18 @@ class _TrackTileState extends State<_TrackTile>
                           width: 50,
                           height: 50,
                           fit: BoxFit.cover,
-                            errorBuilder: (_, __, ___) => Container(
+                          errorBuilder: (_, __, ___) => Container(
                             width: 50,
                             height: 50,
                             color: kPurple3,
-                            child: const Icon(Icons.music_note_rounded,
-                                color: kViolet),
+                            child: const Icon(Icons.music_note_rounded, color: kViolet),
                           ),
                         )
                       : Container(
                           width: 50,
                           height: 50,
                           color: kPurple3,
-                          child: const Icon(Icons.music_note_rounded,
-                              color: kViolet),
+                          child: const Icon(Icons.music_note_rounded, color: kViolet),
                         ),
                 ),
                 const SizedBox(width: 12),
@@ -1519,17 +1441,12 @@ class _TrackTileState extends State<_TrackTile>
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(widget.track.title,
-                          style: const TextStyle(
-                              color: kWhite,
-                              fontWeight: FontWeight.w600,
-                              fontSize: 14),
+                          style: const TextStyle(color: kWhite, fontWeight: FontWeight.w600, fontSize: 14),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis),
                       const SizedBox(height: 2),
                       Text(widget.track.artist,
-                          style: TextStyle(
-                              color: kWhite.withValues(alpha: 0.45),
-                              fontSize: 12),
+                          style: TextStyle(color: kWhite.withValues(alpha: 0.45), fontSize: 12),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis),
                     ],
@@ -1537,8 +1454,7 @@ class _TrackTileState extends State<_TrackTile>
                 ),
                 const SizedBox(width: 8),
                 Text(widget.track.duration,
-                    style: TextStyle(
-                        color: kWhite.withValues(alpha: 0.3), fontSize: 12)),
+                    style: TextStyle(color: kWhite.withValues(alpha: 0.3), fontSize: 12)),
               ],
             ),
           ),
@@ -1561,8 +1477,7 @@ class _CtrlBtn extends StatelessWidget {
           decoration: BoxDecoration(
             shape: BoxShape.circle,
             color: kGlass,
-            border: Border.all(
-                color: kViolet.withValues(alpha: 0.2), width: 1),
+            border: Border.all(color: kViolet.withValues(alpha: 0.2), width: 1),
           ),
           child: Icon(icon, color: kWhite, size: size),
         ),
